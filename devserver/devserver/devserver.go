@@ -93,11 +93,49 @@ type headerSuppressorResponseWriter struct {
 // WriteHeader implements http.ResponseWriter.WriteHeader.
 func (w *headerSuppressorResponseWriter) WriteHeader(code int) {}
 
+type fileHandlerConfig struct {
+	// resolvePath resolves the specified path within a given root using Bazel's runfile resolution.
+	// This is necessary because on Windows, runfiles are not symlinked and need to be
+	// resolved using the runfile manifest file.
+	resolvePathFn func(root string, manifestFilePath string) (resolvedPath string, err error)
+
+	// handleMissingUserIndex is applied to a request when no index file is found within the
+	// set of pkgs passed
+	handleMissingUserIndex http.Handler
+}
+
+func (config *fileHandlerConfig) resolvePath(root string, manifestFilePath string) (resolvedPath string, err error) {
+	if config.resolvePathFn == nil {
+		return runfiles.Runfile(root, manifestFilePath)
+	}
+	return config.resolvePathFn(root, manifestFilePath)
+}
+
+// FileHandlerOption customizes the behavior of CreateFileHandler.
+type FileHandlerOption struct {
+	applyToConfig func(*fileHandlerConfig)
+}
+
+// RunfileResolver returns an option that customizes the way the paths  are loaded.
+//
+// resolvePathFn resolves the specified manfest file path within a given root.
+func RunfileResolver(resolvePathFn func(root string, manifestFilePath string) (resolvedPath string, err error)) FileHandlerOption {
+	return FileHandlerOption{
+		func(config *fileHandlerConfig) {
+			config.resolvePathFn = resolvePathFn
+		},
+	}
+}
+
 // CreateFileHandler returns an http handler to locate files on disk
-func CreateFileHandler(servingPath, manifest string, pkgs []string, base string) http.HandlerFunc {
+func CreateFileHandler(servingPath, manifest string, pkgs []string, base string, opts ...FileHandlerOption) http.HandlerFunc {
+	config := &fileHandlerConfig{}
+	for _, opt := range opts {
+		opt.applyToConfig(config)
+	}
 	// We want to add the root runfile path because by default developers should be able to request
 	// runfiles through their absolute manifest path (e.g. "my_workspace_name/src/file.css")
-	pkgPaths := dirHTTPFileSystem{append(pkgs, "./"), base}
+	pkgPaths := dirHTTPFileSystem{append(pkgs, "./"), base, config}
 
 	fileHandler := http.FileServer(pkgPaths).ServeHTTP
 
@@ -118,7 +156,7 @@ func CreateFileHandler(servingPath, manifest string, pkgs []string, base string)
 		// search through pkgs for the first index.html file found if any exists
 		for _, pkg := range pkgs {
 			// File path is not cached, so that a user's edits will be reflected.
-			userIndexFile, err := runfiles.Runfile(base, pathReplacer.Replace(filepath.Join(pkg, "index.html")))
+			userIndexFile, err := config.resolvePath(base, pathReplacer.Replace(filepath.Join(pkg, "index.html")))
 
 			// In case the potential user index file couldn't be found in the runfiles,
 			// continue searching within other packages.
@@ -128,6 +166,10 @@ func CreateFileHandler(servingPath, manifest string, pkgs []string, base string)
 
 			// We can assume that the file is readable if it's listed in the runfiles manifest.
 			http.ServeFile(w, r, userIndexFile)
+			return
+		}
+		if config.handleMissingUserIndex != nil {
+			config.handleMissingUserIndex.ServeHTTP(w, r)
 			return
 		}
 		content := bytes.NewReader(defaultPage)
@@ -170,13 +212,14 @@ func CreateFileHandler(servingPath, manifest string, pkgs []string, base string)
 // dirHTTPFileSystem implements http.FileSystem by looking in the list of dirs one after each other.
 type dirHTTPFileSystem struct {
 	packageDirs []string
-	base string
+	base        string
+	config      *fileHandlerConfig
 }
 
 func (fs dirHTTPFileSystem) Open(name string) (http.File, error) {
 	for _, packageName := range fs.packageDirs {
 		manifestFilePath := filepath.Join(packageName, name)
-		realFilePath, err := runfiles.Runfile(fs.base, manifestFilePath)
+		realFilePath, err := fs.config.resolvePath(fs.base, manifestFilePath)
 
 		if err != nil {
 			// In case the runfile could not be found, we also need to check that the requested
@@ -202,7 +245,7 @@ func (fs dirHTTPFileSystem) Open(name string) (http.File, error) {
 		// Bazel runs with symlinked runfiles (e.g. on MacOS, linux). In that case, we
 		// just look for a index.html in the directory.
 		if stat.IsDir() {
-			realFilePath, err = runfiles.Runfile(fs.base, filepath.Join(manifestFilePath, "index.html"))
+			realFilePath, err = fs.config.resolvePath(fs.base, filepath.Join(manifestFilePath, "index.html"))
 
 			// In case the index.html file of the requested directory couldn't be found,
 			// we just continue searching.
@@ -210,7 +253,6 @@ func (fs dirHTTPFileSystem) Open(name string) (http.File, error) {
 				continue
 			}
 		}
-
 
 		// We can assume that the file is present, if it's listed in the runfile manifest. Though, we
 		// return the error, in case something prevented the read-access.
