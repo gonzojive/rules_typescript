@@ -277,15 +277,17 @@ func (cache *FileCache) refreshFiles(files []string) {
 			resolvedPath, err := cache.fs.ResolvePath(cache.root, path)
 
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "could not resolve path %s. %v\n", path, err)
-				os.Exit(1)
-			}
-
-			// Create a new cache entry with the corresponding resolved path. Also normalize the path
-			// before storing it persistently in the cache. The normalizing is good to do here because
-			// the path might be used in browser source URLs and should be kept in posix format.
-			entry = &cacheEntry{
-				resolvedPath: pathReplacer.Replace(resolvedPath),
+				log.Printf("could not resolve path %s: %v", path, err)
+				entry = &cacheEntry{
+					err: fmt.Errorf("could not resolve path %s: %w", path, err),
+				}
+			} else {
+				// Create a new cache entry with the corresponding resolved path. Also normalize the path
+				// before storing it persistently in the cache. The normalizing is good to do here because
+				// the path might be used in browser source URLs and should be kept in posix format.
+				entry = &cacheEntry{
+					resolvedPath: pathReplacer.Replace(resolvedPath),
+				}
 			}
 			cache.entries[path] = entry
 		}
